@@ -13,7 +13,7 @@ if ($Global:CCH_Debug) { $ErrorActionPreference = 'Continue' } else { $ErrorActi
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Off
 
-$Global:CCH_Version = '2.9.1'
+$Global:CCH_Version = '2.9.2'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -1587,7 +1587,7 @@ function Get-ScanReport($s) {
 # ==================================================================================================
 
 $Global:LicPepper   = 'CCH:fc0ffc61977afccc4d42ac44daa6b0c1b75af1e021140ef8'
-$Global:IntegrityBaseline = '3d914601c792c3eaaed956db73b3dee7d0e5ba46ab8128c1d38c7f0f6f42c7d0'
+$Global:IntegrityBaseline = 'a214a27ecdab46cdef1fead0ac4a681bc7b382901386888a750771d514f3229e'
 $Global:LicFile     = Join-Path $Global:DataDir 'license.dat'
 $Global:LicLedgerKey = 'HKLM:\SOFTWARE\Kuro\Redeemed'
 $Global:LicCodes    = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -1639,7 +1639,7 @@ function Confirm-LicenseOnline {
     $info = Get-LicenseInfo
     if (-not $info) { return $true }
     $r = Invoke-OnlineRedeem ([string]$info.hash) ([string]$info.machine)
-    if (-not $r.Ok -and ($r.Reason -eq 'used' -or $r.Reason -eq 'invalid')) { return $false }
+    if (-not $r.Ok -and ($r.Reason -eq 'used' -or $r.Reason -eq 'invalid' -or $r.Reason -eq 'expired')) { return $false }
     return $true
 }
 
@@ -1647,6 +1647,50 @@ function Get-MachineId {
     $g = (Read-RegValue 'HKLM:\SOFTWARE\Microsoft\Cryptography' 'MachineGuid').Data
     if (-not $g) { $g = $env:COMPUTERNAME }
     return (Get-Sha256Hex ('cch-machine|' + $g)).Substring(0, 32)
+}
+
+# ------------------------------------------------------------------ timed keys (1 day / 3 days / 1 week)
+function Get-NowMs { return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+
+function Test-TimedCode([string]$Normal) { return ($Normal -match '^K[0-9]D[A-Z0-9]{12}$') }
+
+function Get-LicenseSig($Hash, $Machine, $Activated, $Expires) {
+    # lifetime licences keep the original signature so every existing license.dat stays valid
+    if ([int64]$Expires -gt 0) { return (Get-HmacHex ("{0}|{1}|{2}|{3}" -f $Hash, $Machine, $Activated, [int64]$Expires)) }
+    return (Get-HmacHex ("{0}|{1}|{2}" -f $Hash, $Machine, $Activated))
+}
+
+function Get-LicenseExpiry {
+    # 0 = lifetime (or no licence); otherwise the end time in Unix milliseconds
+    $i = Get-LicenseInfo
+    if ($i -and $i.expires) { try { return [int64]$i.expires } catch { } }
+    return [int64]0
+}
+
+function Test-ClockOk {
+    # A timed key must not be stretched by winding the PC clock back. Kuro remembers the latest time
+    # it has seen; a clock more than an hour behind that counts as "time is up".
+    $now = Get-NowMs
+    $mark = [int64]0
+    try { $v = (Read-RegValue 'HKLM:\SOFTWARE\Kuro' 'ClockMark').Data; if ($v) { $mark = [int64]$v } } catch { }
+    if ($mark -gt 0 -and $now -lt ($mark - 3600000)) { return $false }
+    if ($now -gt $mark + 60000) { try { Write-RegValue 'HKLM:\SOFTWARE\Kuro' 'ClockMark' 'String' ([string]$now) } catch { } }
+    return $true
+}
+
+function Test-LicenseExpired {
+    # true when there is a timed licence on this PC and its time is up
+    $exp = Get-LicenseExpiry
+    if ($exp -le 0) { return $false }
+    return ((Get-NowMs) -gt $exp -or -not (Test-ClockOk))
+}
+
+function Format-TimeLeft([int64]$Ms) {
+    if ($Ms -le 0) { return 'ended' }
+    $ts = [TimeSpan]::FromMilliseconds($Ms)
+    if ($ts.TotalDays -ge 1) { return ('{0}d {1}h left' -f [math]::Floor($ts.TotalDays), $ts.Hours) }
+    if ($ts.TotalHours -ge 1) { return ('{0}h {1}m left' -f [math]::Floor($ts.TotalHours), $ts.Minutes) }
+    return ('{0}m left' -f [math]::Max(1, [math]::Ceiling($ts.TotalMinutes)))
 }
 
 function Load-LicenseData {
@@ -1684,10 +1728,13 @@ function Test-License {
     try {
         $l = [IO.File]::ReadAllText($Global:LicFile) | ConvertFrom-Json
         if ($l.machine -ne (Get-MachineId)) { return $false }
-        if (-not $Global:LicCodes.Contains([string]$l.hash)) { return $false }
+        $exp = [int64]0; if ($l.expires) { $exp = [int64]$l.expires }
+        # timed keys are made by the Discord bot, so they are checked by the server instead of data\codes.db
+        if ($exp -le 0 -and -not $Global:LicCodes.Contains([string]$l.hash)) { return $false }
         if ($Global:LicRevoked.Contains([string]$l.hash)) { return $false }
-        $sig = Get-HmacHex ("{0}|{1}|{2}" -f $l.hash, $l.machine, $l.activated)
-        return ($sig -eq $l.sig)
+        if ((Get-LicenseSig $l.hash $l.machine $l.activated $exp) -ne $l.sig) { return $false }
+        if ($exp -gt 0 -and ((Get-NowMs) -gt $exp -or -not (Test-ClockOk))) { return $false }
+        return $true
     } catch { return $false }
 }
 
@@ -1711,7 +1758,9 @@ function Invoke-OnlineRedeem([string]$Hash, [string]$Machine) {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $body = ConvertTo-Json -InputObject @{ hash = $Hash; machine = $Machine } -Compress
         $r = Invoke-RestMethod -Uri ($url + '/redeem') -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15 -ErrorAction Stop
-        return @{ Ok = [bool]$r.ok; Reason = [string]$r.reason }
+        $exp = [int64]0; $days = 0
+        try { if ($r.expires) { $exp = [int64]$r.expires }; if ($r.days) { $days = [int]$r.days } } catch { }
+        return @{ Ok = [bool]$r.ok; Reason = [string]$r.reason; Expires = $exp; Days = $days }
     } catch {
         return @{ Ok = $false; Reason = 'network' }
     }
@@ -1720,16 +1769,22 @@ function Invoke-OnlineRedeem([string]$Hash, [string]$Machine) {
 function Invoke-Redeem([string]$Code) {
     if (-not (Test-ScriptIntegrity)) { return @{ Ok = $false; Msg = 'This copy of Kuro has been modified, so Premium is disabled. Please download a fresh copy from the official Discord.' } }
     $n = ConvertTo-NormalCode $Code
-    if ($n.Length -ne 15 -or -not $n.StartsWith('CCH')) { return @{ Ok = $false; Msg = 'That does not look like a Kuro code. Format: CCH-XXXX-XXXX-XXXX' } }
+    $timed = Test-TimedCode $n
+    if ($n.Length -ne 15 -or -not ($n.StartsWith('CCH') -or $timed)) { return @{ Ok = $false; Msg = 'That does not look like a Kuro code. Format: CCH-XXXX-XXXX-XXXX (or K1D / K3D / K7D for timed keys)' } }
     $h = Get-CodeHash $Code
-    if (-not $Global:LicCodes.Contains($h) -or $Global:LicRevoked.Contains($h)) {
+    if ($timed) {
+        if (-not (Get-LicenseServer)) { return @{ Ok = $false; Msg = 'Timed keys need the Kuro server. Update Kuro and try again.' } }
+    } elseif (-not $Global:LicCodes.Contains($h) -or $Global:LicRevoked.Contains($h)) {
         Start-Sleep -Milliseconds 700   # slow down guessing
         return @{ Ok = $false; Msg = 'Invalid code. Check for typos (codes never contain 0, O, 1 or I).' }
     }
     if (Test-License) {
         $cur = Get-LicenseInfo
         if ($cur -and $cur.hash -eq $h) { return @{ Ok = $true; Msg = 'This code is already active on this PC.' } }
-        return @{ Ok = $false; Msg = 'Premium is already active on this PC - keep this code for someone else.' }
+        # a timed key can be upgraded to lifetime straight away; lifetime never needs another code
+        $curExp = Get-LicenseExpiry
+        if ($curExp -le 0) { return @{ Ok = $false; Msg = 'Lifetime Premium is already active on this PC - keep this code for someone else.' } }
+        if ($timed) { return @{ Ok = $false; Msg = ('Your current key still has ' + (Format-TimeLeft ($curExp - (Get-NowMs))) + '. Redeem this one after it ends so you do not lose any time (a lifetime code can be redeemed now).') } }
     }
     if (Test-CodeRedeemedHere $h) { return @{ Ok = $false; Msg = 'This code has already been used and cannot be redeemed again.' } }
 
@@ -1739,23 +1794,31 @@ function Invoke-Redeem([string]$Code) {
         switch ($online.Reason) {
             'used'    { return @{ Ok = $false; Msg = 'This code has already been used on another PC.' } }
             'invalid' { return @{ Ok = $false; Msg = 'This code is not valid on the license server.' } }
+            'expired' { return @{ Ok = $false; Msg = 'This key has run out. Get a new one in the Kuro Discord.' } }
             'network' { return @{ Ok = $false; Msg = 'Could not reach the license server. Check your internet connection and try again.' } }
             default   { return @{ Ok = $false; Msg = 'The license server rejected this code.' } }
         }
     }
 
+    $exp = [int64]$online.Expires
+    if ($timed -and $exp -le 0) { return @{ Ok = $false; Msg = 'The license server did not return an end time for this key. Try again in a minute.' } }
     $act = Get-Date -Format 's'
     $lic = [ordered]@{
-        product   = 'Kuro Premium'
+        product   = $(if ($exp -gt 0) { 'Kuro Premium (' + $online.Days + ' day key)' } else { 'Kuro Premium' })
         code      = ($n.Substring(0, 3) + '-' + $n.Substring(3, 4) + '-****-' + $n.Substring(11, 4))
         hash      = $h
         machine   = $mid
         activated = $act
-        sig       = (Get-HmacHex ("{0}|{1}|{2}" -f $h, $mid, $act))
     }
+    if ($exp -gt 0) { $lic.days = [int]$online.Days; $lic.expires = [string]$exp }
+    $lic.sig = Get-LicenseSig $h $mid $act $exp
     [IO.File]::WriteAllText($Global:LicFile, (ConvertTo-Json -InputObject $lic), $Global:Utf8NoBom)
     Add-CodeRedeemedHere $h
     Write-Log "Premium activated with code $($lic.code)"
+    if ($exp -gt 0) {
+        $end = [DateTimeOffset]::FromUnixTimeMilliseconds($exp).LocalDateTime
+        return @{ Ok = $true; Msg = ('Premium unlocked until {0:ddd d MMM, HH:mm} ({1}). When it ends, Kuro puts every Premium change back by itself.' -f $end, (Format-TimeLeft ($exp - (Get-NowMs)))) }
+    }
     return @{ Ok = $true; Msg = 'Premium unlocked! Thank you for supporting Kuro.' }
 }
 
@@ -1765,14 +1828,15 @@ function Invoke-Redeem([string]$Code) {
 #  stored only as a salted PBKDF2 hash on the server; this app never stores the password.
 # ==================================================================================================
 
-function Write-LocalLicense([string]$Hash) {
-    if (-not $Hash -or -not $Global:LicCodes.Contains($Hash) -or $Global:LicRevoked.Contains($Hash)) { return $false }
+function Write-LocalLicense([string]$Hash, [int64]$Expires = 0, [int]$Days = 0) {
+    if (-not $Hash -or $Global:LicRevoked.Contains($Hash)) { return $false }
+    if ($Expires -gt 0) { if ((Get-NowMs) -gt $Expires) { return $false } }   # timed key on the account has run out
+    elseif (-not $Global:LicCodes.Contains($Hash)) { return $false }
     $mid = Get-MachineId
     $act = Get-Date -Format 's'
-    $lic = [ordered]@{
-        product = 'Kuro Premium'; code = '(account)'; hash = $Hash; machine = $mid; activated = $act
-        sig = (Get-HmacHex ("{0}|{1}|{2}" -f $Hash, $mid, $act))
-    }
+    $lic = [ordered]@{ product = 'Kuro Premium'; code = '(account)'; hash = $Hash; machine = $mid; activated = $act }
+    if ($Expires -gt 0) { $lic.product = "Kuro Premium ($Days day key)"; $lic.days = $Days; $lic.expires = [string]$Expires }
+    $lic.sig = Get-LicenseSig $Hash $mid $act $Expires
     [IO.File]::WriteAllText($Global:LicFile, (ConvertTo-Json -InputObject $lic), $Global:Utf8NoBom)
     Write-Log 'Premium restored from account on this PC.'
     return $true
@@ -1817,7 +1881,8 @@ function Login-Account([string]$User, [string]$Pass) {
     $msg = 'Logged in. No Premium is linked to this account yet.'
     if ($lic) {
         if (Test-License) { $msg = 'Logged in. Premium is active.' }
-        elseif (Write-LocalLicense $lic) { $msg = 'Logged in. Premium restored on this PC!' }
+        elseif (Write-LocalLicense $lic ([int64]$(if ($r.expires) { $r.expires } else { 0 })) ([int]$(if ($r.days) { $r.days } else { 0 }))) { $msg = 'Logged in. Premium restored on this PC!' }
+        elseif ($r.expires -and [int64]$r.expires -lt (Get-NowMs)) { $msg = 'Logged in, but the timed key on this account has run out.' }
         else { $msg = 'Logged in, but the linked Premium code is not valid in this version.' }
     } elseif (Test-License) {
         $info = Get-LicenseInfo
@@ -2787,20 +2852,32 @@ function Update-PremiumUI {
     $Global:CCH.Premium = (Test-License) -and (-not $Global:CCH.Tampered)
     if ($Global:CCH.Premium -and -not (Confirm-LicenseOnline)) {
         $Global:CCH.Premium = $false
-        try { Remove-Item -LiteralPath $Global:LicFile -Force -ErrorAction SilentlyContinue } catch { }
-        Write-Log 'License was rejected by the license server (used on another PC or revoked). Premium disabled.'
+        if ((Get-LicenseExpiry) -gt 0) { Request-PremiumExpiry }   # server says the timed key is over: revert like a normal expiry
+        else { try { Remove-Item -LiteralPath $Global:LicFile -Force -ErrorAction SilentlyContinue } catch { } }
+        Write-Log 'License was rejected by the license server (used on another PC, revoked or expired). Premium disabled.'
     }
     if ($Global:CCH.Tampered) { Write-Log 'Integrity check failed: the script was modified. Premium features are locked.' }
+    if (-not $Global:CCH.Premium -and (Test-LicenseExpired)) { Request-PremiumExpiry }
+    Start-PremiumClock
     $ui = $Global:UI
     if ($Global:CCH.Premium) {
         $info = Get-LicenseInfo
+        $exp = Get-LicenseExpiry
         $ui.TitlePlan.Text = 'PREMIUM'
         $ui.StatPremium.Text = 'Premium'
         $ui.StatPremiumSub.Text = 'All features unlocked'
         $ui.PremStatus.Text = 'Premium is active on this PC'
         $ui.PremSub.Text = "Code $($info.code)  -  activated $(([string]$info.activated).Replace('T', ' '))"
-        $ui.BtnRedeem.IsEnabled = $false
-        $ui.CodeBox.IsEnabled = $false
+        if ($exp -gt 0) {
+            $left = Format-TimeLeft ($exp - (Get-NowMs))
+            $end = [DateTimeOffset]::FromUnixTimeMilliseconds($exp).LocalDateTime
+            $ui.StatPremiumSub.Text = 'Timed key: ' + $left
+            $ui.PremStatus.Text = 'Premium is active on this PC  -  ' + $left
+            $ui.PremSub.Text = ('{0}-day key {1}  -  ends {2:ddd d MMM, HH:mm}. When it ends Kuro puts every Premium change back by itself. A lifetime code can be redeemed any time to upgrade.' -f $info.days, $info.code, $end)
+        }
+        # a timed key can be upgraded to lifetime, so keep the code box open for it
+        $ui.BtnRedeem.IsEnabled = ($exp -gt 0)
+        $ui.CodeBox.IsEnabled = ($exp -gt 0)
         $ui.BoostSub.Text = 'Ready when you are'
     } else {
         $ui.TitlePlan.Text = 'FREE'
@@ -8028,6 +8105,83 @@ function Get-DiscordRoleCode {
     $code = [string]$r.code
     try { [Windows.Clipboard]::SetText('/premium ' + $code) } catch { }
     Show-Modal 'Your Discord code' ("Your code is  $code`n`nIn the Kuro Discord, type:  /premium $code`n(It's already copied, so you can just paste it.)`n`nThe code works once and lasts 15 minutes.") 'Open Discord' 'Close' { Open-Discord } $null 'star'
+}
+
+
+# ==================================================================================================
+#  TIMED KEYS RUNNING OUT
+#  A 1 day / 3 day / 1 week key switches itself off: Premium turns off, every Premium tweak that is
+#  still on gets reverted from Kuro's backup (the same as switching it off by hand), Game Boost and
+#  stream proof stop, and the user is told why. Free tweaks the user chose are left alone.
+# ==================================================================================================
+$Global:PremExpiry = @{ Pending = $false; Timer = $null }
+
+function Start-PremiumClock {
+    # checks once a minute while Kuro is open, so a key that ends mid-session is handled straight away
+    if ($Global:PremExpiry.Timer) { return }
+    $t = New-Object Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromSeconds(60)
+    $t.Add_Tick({
+        try {
+            $exp = Get-LicenseExpiry
+            if ($exp -le 0) { return }
+            if (Test-LicenseExpired) { $Global:CCH.Premium = $false; Request-PremiumExpiry }
+            elseif ($Global:CCH.Premium) {
+                $left = Format-TimeLeft ($exp - (Get-NowMs))
+                $Global:UI.StatPremiumSub.Text = 'Timed key: ' + $left
+                $Global:UI.PremStatus.Text = 'Premium is active on this PC  -  ' + $left
+            }
+        } catch { Write-Log "Premium clock: $($_.Exception.Message)" }
+    })
+    $t.Start()
+    $Global:PremExpiry.Timer = $t
+}
+
+function Request-PremiumExpiry {
+    # run it on the dispatcher so it never fires half-way through building the UI
+    if ($Global:PremExpiry.Pending) { return }
+    $Global:PremExpiry.Pending = $true
+    $t = New-Object Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromMilliseconds(4000)
+    $t.Add_Tick({ $this.Stop(); try { Invoke-PremiumExpiry } catch { Write-Log "Premium expiry: $($_.Exception.Message)" } finally { $Global:PremExpiry.Pending = $false } })
+    $t.Start()
+}
+
+function Invoke-PremiumExpiry {
+    $info = Get-LicenseInfo
+    if (-not $info -or -not $info.expires) { return }
+    $days = [int]$info.days
+    $what = $(if ($days -eq 1) { '1 day' } elseif ($days -eq 7) { '1 week' } elseif ($days -gt 0) { "$days day" } else { 'timed' })
+    # keep a record, then remove the licence so nothing treats this PC as Premium any more
+    try { Move-Item -LiteralPath $Global:LicFile -Destination (Join-Path $Global:DataDir 'license.expired.dat') -Force -ErrorAction Stop }
+    catch { try { Remove-Item -LiteralPath $Global:LicFile -Force -ErrorAction SilentlyContinue } catch { } }
+    $Global:CCH.Premium = $false
+    Write-Log "Timed Premium key ($what) ended - switching Premium off and reverting Premium changes."
+    # Premium-only things that are running right now
+    try { if ($Global:CCH.Boost -and $Global:CCH.Boost.On) { Stop-Boost } } catch { }
+    # every Premium tweak that is still applied goes back to how the PC was before it
+    $list = @($Global:Tweaks | Where-Object { $_.Premium -and $_.Applied })
+    $reverted = 0; $failed = 0
+    if ($list.Count) {
+        Show-Busy 'Your Premium time is up' 'Putting Premium changes back...'
+        $i = 0
+        foreach ($t in $list) {
+            $i++
+            Set-BusyText ("[{0}/{1}]  Restoring {2}" -f $i, $list.Count, $t.Name)
+            $r = Set-TweakState $t $false
+            if ($r.Ok) { $reverted++ } else { $failed++ }
+            Refresh-Tweak $t
+            Pump-UI
+        }
+        Hide-Busy
+    }
+    Update-PremiumUI
+    Update-AllViews
+    $msg = "Your $what Premium key has ended, so Premium is now switched off on this PC."
+    if ($reverted) { $msg += "`n`nKuro put back the $reverted Premium change" + $(if ($reverted -ne 1) { 's' } else { '' }) + ' it had made, so those settings are exactly how they were before.' }
+    if ($failed) { $msg += "`n$failed could not be put back automatically - use Settings > Restore everything, or ask in the Kuro Discord." }
+    $msg += "`n`nAll free features keep working. Want Premium again? Grab another key in the Kuro Discord."
+    Show-Modal 'Your Premium time is up' $msg 'Get another key' 'OK' { Show-Page 'PagePremium' } $null 'star'
 }
 
 # ==================================================================================================
