@@ -13,7 +13,7 @@ if ($Global:CCH_Debug) { $ErrorActionPreference = 'Continue' } else { $ErrorActi
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Off
 
-$Global:CCH_Version = '2.9.0'
+$Global:CCH_Version = '2.9.1'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -66,6 +66,15 @@ else { $Global:AppDir = Split-Path -Parent ([Diagnostics.Process]::GetCurrentPro
 $Global:DefaultUpdateUrl = 'https://raw.githubusercontent.com/su3strm/Kuro/main'
 # Owner's license / account / live-stats server (Cloudflare Worker URL). Users can override it in Settings.
 $Global:DefaultLicenseServer = ''
+# Kuro Discord bot address (data\bot.txt, shipped through auto-update) - used by Premium > Get my Discord role
+$Global:DiscordBotUrl = ''
+try {
+    $botTxt = Join-Path $Global:AppDir 'data\bot.txt'
+    if (Test-Path -LiteralPath $botTxt) {
+        $bl = ([IO.File]::ReadAllText($botTxt)).Trim().TrimEnd('/')
+        if ($bl -match '^https://[A-Za-z0-9.-]+$') { $Global:DiscordBotUrl = $bl }
+    }
+} catch { }
 # The owner's setup script writes the server address into data\server.txt and it reaches every copy
 # through auto-update, so no rebuild is needed to connect existing copies.
 try {
@@ -1578,7 +1587,7 @@ function Get-ScanReport($s) {
 # ==================================================================================================
 
 $Global:LicPepper   = 'CCH:fc0ffc61977afccc4d42ac44daa6b0c1b75af1e021140ef8'
-$Global:IntegrityBaseline = '190843fa7559da2f9db023b525b1c51de8af766bcbf9d126dac78659ca24e424'
+$Global:IntegrityBaseline = '3d914601c792c3eaaed956db73b3dee7d0e5ba46ab8128c1d38c7f0f6f42c7d0'
 $Global:LicFile     = Join-Path $Global:DataDir 'license.dat'
 $Global:LicLedgerKey = 'HKLM:\SOFTWARE\Kuro\Redeemed'
 $Global:LicCodes    = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -7931,6 +7940,7 @@ function Update-PremiumLocks {
         $ui.SetProofTxt.Text = 'Stream proof: hide Kuro from screenshots and screen share' + $(if ($prem) { '' } else { '  (Premium)' })
     }
     if ($ui.GbStreamProof) { $ui.GbStreamProof.IsEnabled = $prem }
+    if ($ui.BtnDiscordRole) { $ui.BtnDiscordRole.Visibility = $(if ($prem -and $Global:DiscordBotUrl) { 'Visible' } else { 'Collapsed' }) }
     # Premium is only known after the start-up check, so apply a saved stream-proof setting here
     if ($prem -and $Global:CCH.Settings.StreamProof) { foreach ($w in @($Global:KuroWindows)) { [void](Set-WindowProof $w $true) } }
     # losing Premium (revoked, tamper, moved PC) switches Premium-only features off
@@ -7994,6 +8004,30 @@ function Hide-PremiumWelcome {
     $a.Add_Completed({ $Global:UI.PremBanner.Visibility = 'Collapsed' })
     if ($tt -is [Windows.Media.TranslateTransform]) { $tt.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $a) } else { $b.Visibility = 'Collapsed' }
     $b.BeginAnimation([Windows.UIElement]::OpacityProperty, (New-Object Windows.Media.Animation.DoubleAnimation 1, 0, $dur))
+}
+
+
+# ------------------------------------------------------------------ Discord Premium role
+# Asks the Kuro bot for a single-use 6-digit code proving this PC holds a redeemed licence;
+# the user types /premium <code> in the Kuro Discord to get the Premium role.
+function Get-DiscordRoleCode {
+    if (-not $Global:CCH.Premium) { Show-PremiumPrompt 'Discord Premium role'; return }
+    if (-not $Global:DiscordBotUrl) { Show-Toast 'The Kuro Discord bot is not set up yet.' 'info'; return }
+    $info = Get-LicenseInfo
+    if (-not $info -or -not $info.hash) { Show-Toast "Couldn't find this PC's Premium licence. Redeem your code again, then try this." 'error'; return }
+    Show-Busy 'Getting your Discord code...'
+    $r = $null
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $body = ConvertTo-Json -Compress -InputObject @{ hash = [string]$info.hash; machine = (Get-MachineId) }
+        $r = Invoke-RestMethod -Uri ($Global:DiscordBotUrl + '/discord-code') -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15 -ErrorAction Stop
+    } catch { $r = $null }
+    Hide-Busy
+    if (-not $r) { Show-Toast "Couldn't reach the Kuro bot. Check your internet and try again." 'error'; return }
+    if (-not $r.ok) { Show-Toast $(if ($r.reason -eq 'not_premium') { 'The server does not see an active Premium licence for this PC. Use /bug in the Discord if that is wrong.' } else { 'Something went wrong. Try again in a minute.' }) 'error'; return }
+    $code = [string]$r.code
+    try { [Windows.Clipboard]::SetText('/premium ' + $code) } catch { }
+    Show-Modal 'Your Discord code' ("Your code is  $code`n`nIn the Kuro Discord, type:  /premium $code`n(It's already copied, so you can just paste it.)`n`nThe code works once and lasts 15 minutes.") 'Open Discord' 'Close' { Open-Discord } $null 'star'
 }
 
 # ==================================================================================================
@@ -9776,7 +9810,10 @@ $Global:MainXaml = @'
               <TextBlock Text="Username" Style="{StaticResource Sub}" FontSize="11" Margin="2,5,0,0"/>
               <Grid Margin="0,10,0,0">
                 <TextBlock x:Name="AccMsg" Style="{StaticResource Sub}" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                <Button x:Name="BtnAccountBuy" Style="{StaticResource GhostBtn}" Content="Get Premium on Discord" Padding="14,7" HorizontalAlignment="Right"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                  <Button x:Name="BtnDiscordRole" Style="{StaticResource AccentBtn}" Content="Get my Discord role" Padding="14,7" Margin="0,0,8,0" Visibility="Collapsed"/>
+                  <Button x:Name="BtnAccountBuy" Style="{StaticResource GhostBtn}" Content="Get Premium on Discord" Padding="14,7"/>
+                </StackPanel>
               </Grid>
             </StackPanel>
           </Border>
@@ -10153,6 +10190,7 @@ function Start-Kuro {
     try { Connect-Cross } catch { Write-Log "Crosshair page failed: $($_.Exception.Message)" }
     try { Connect-GameBar } catch { Write-Log "Game Bar failed: $($_.Exception.Message)" }
     try { Initialize-PremiumLocks } catch { Write-Log "Premium locks failed: $($_.Exception.Message)" }
+    $Global:UI.BtnDiscordRole.Add_Click({ Get-DiscordRoleCode })
     Connect-Tutorial
     Init-Spinner
     Update-Mascots
