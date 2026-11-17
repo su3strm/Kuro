@@ -13,7 +13,7 @@ if ($Global:CCH_Debug) { $ErrorActionPreference = 'Continue' } else { $ErrorActi
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Off
 
-$Global:CCH_Version = '2.9.3'
+$Global:CCH_Version = '2.9.4'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -1587,7 +1587,7 @@ function Get-ScanReport($s) {
 # ==================================================================================================
 
 $Global:LicPepper   = 'CCH:fc0ffc61977afccc4d42ac44daa6b0c1b75af1e021140ef8'
-$Global:IntegrityBaseline = '034e3faa31097c38d4ef917c9db7054aad6856a64462f18a4a77a9662bb5807b'
+$Global:IntegrityBaseline = 'cf46a63a0211d0600091c6e9949236fee443b5810698337e2b63360586d09c3d'
 $Global:LicFile     = Join-Path $Global:DataDir 'license.dat'
 $Global:LicLedgerKey = 'HKLM:\SOFTWARE\Kuro\Redeemed'
 $Global:LicCodes    = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -1799,6 +1799,7 @@ function Invoke-Redeem([string]$Code) {
             'used'    { return @{ Ok = $false; Msg = 'This code has already been used on another PC.' } }
             'invalid' { return @{ Ok = $false; Msg = 'This code is not valid on the license server.' } }
             'expired' { return @{ Ok = $false; Msg = 'This key has run out. Get a new one in the Kuro Discord.' } }
+            'slow_down' { return @{ Ok = $false; Msg = 'Too many tries from this connection. Wait 10 minutes and try again.' } }
             'network' { return @{ Ok = $false; Msg = 'Could not reach the license server. Check your internet connection and try again.' } }
             default   { return @{ Ok = $false; Msg = 'The license server rejected this code.' } }
         }
@@ -1861,6 +1862,7 @@ $Global:AccErr = @{
     weak_password = 'Password must be at least 6 characters.'; nouser = 'No account found with that username.'
     badpass = 'Wrong password.'; network = 'Could not reach the account server. Check your internet.'
     noserver = 'No account server is set up yet. The owner must deploy one (see the owner guide).'
+    slow_down = 'Too many tries from this connection. Wait 10 minutes and try again.'
 }
 
 function Register-Account([string]$User, [string]$Pass) {
@@ -4368,14 +4370,28 @@ $Global:UpdateWorker = {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $base = $url.TrimEnd('/')
-        $m = Invoke-RestMethod -Uri ($base + '/manifest.json?nocache=' + [DateTime]::UtcNow.Ticks) -TimeoutSec 20 -ErrorAction Stop
+        # The manifest must carry the owner's signature (manifest.sig). The private key is never on GitHub,
+        # so a hijacked GitHub account or a tampered download cannot push an update that Kuro accepts.
+        $pub = '<RSAKeyValue><Modulus>3y3mawPtmS9z5Q2awo74NrwUqwYsw40RPh/nohG5fTthf1kZsAi4MTso5Zy1xFPPtT/PYJuIrktOhKGJ/9vAg50LOhvP2ODj1ukvC6bJR0VHbMlJx1wn1Fdi5QWsERnce3qMaOaD/d5iuXPWRvXbnLXkh6EMI26PLlNYj+09T05DcL9gN69/+eFGSpUWmoYZqqcqJAKLwkgbCGi4QTnRgBJM7UAKcLTWwV6Cg/b0ypgX4dy6SpEhPehSdEjgWeUPC4cCSWYGM1MYtn44KgPqH2PEax06Fcatu9w5SGOu4qfLAFpkjByH+nxcPv17wvMD9z27JuN01n2iCjlYGm13jMmYBZqKEY+ugEOLFpOOxNHPur4AalCQBrpqV9JsaSfuEL20Dko1llIiWmfRc1JKuywsvMPdrM3w38FeRnOwNvtOQSP4eQAWsBRZ/mOXD8/AFSUcB5POsFngO5gYJyc7HbQH3C/U0/5IjlbwiYH3lfveG3F4mQroFVitqXynatXF</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
+        $nc = [DateTime]::UtcNow.Ticks
+        $wc = New-Object Net.WebClient
+        try {
+            $mb = $wc.DownloadData($base + '/manifest.json?nocache=' + $nc)
+            $sg = ($wc.DownloadString($base + '/manifest.sig?nocache=' + $nc)).Trim()
+        } finally { $wc.Dispose() }
+        $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider
+        try { $rsa.FromXmlString($pub); $okSig = $rsa.VerifyData($mb, 'SHA256', [Convert]::FromBase64String($sg)) } catch { $okSig = $false } finally { $rsa.Dispose() }
+        if (-not $okSig) { $r.error = 'The update was not signed by the Kuro owner, so it was refused.'; $r.failed = 1; return $r }
+        $mt = [Text.Encoding]::UTF8.GetString($mb)
+        if ($mt.Length -gt 0 -and $mt[0] -eq [char]0xFEFF) { $mt = $mt.Substring(1) }
+        $m = $mt | ConvertFrom-Json
         $r.version = [string]$m.version
         $rv = [version](([string]$m.version) -replace '[^0-9.]', ''); $lv = [version]($ver -replace '[^0-9.]', '')
         if ($rv -lt $lv) { return $r }
         $r.newer = ($rv -gt $lv)
         foreach ($prop in $m.files.PSObject.Properties) {
             $rel = [string]$prop.Name; $want = ([string]$prop.Value).ToLowerInvariant()
-            if ($rel -match '\.kuroupd$' -or $rel -eq 'manifest.json' -or $rel -like '*..*' -or $rel -match '^[\\/]' -or $rel -match ':') { continue }
+            if ($rel -match '\.kuroupd$' -or $rel -eq 'manifest.json' -or $rel -eq 'manifest.sig' -or $rel -like '*..*' -or $rel -match '^[\\/]' -or $rel -match ':') { continue }
             if ($want -notmatch '^[0-9a-f]{64}$') { continue }
             $local = Join-Path $app $rel
             if (Test-Path -LiteralPath $local) {
