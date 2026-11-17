@@ -1,8 +1,8 @@
 {
-"version": "2.9.4",
+"version": "2.9.5",
 "files": {
 "Launch Kuro.bat": "3d31859178f401e7948233cbf248609492a9deed3ebfe1fc170c8712e89285d1",
-"Kuro.ps1": "b303b9cbbfc6aca34b37bd6b71dd019f72b6352ff107a418b6450319f1dc6897",
+"Kuro.ps1": "30ebda412f130880c6ee6ffc10a45fbda5d801575efe89a14e88011c18fbca40",
 "README.md": "ece1dea982d84a7aefa6af7248f8f90fcd1fa622902823ad1ed787c35e358aba",
 "Install-Kuro.ps1": "89a71b6ad2bc11e10bbdc575d3f2399802b9b05346e958c51e63c2622161a814",
 "Launch Kuro (debug).bat": "860a3caac0d61862bb85145a00318742015e593b17507d1a9bafbd91870d340c",
@@ -33,8 +33,6 @@
 "assets/sfx/engine.mp3": "07548389d5cd6cb096826406f68cc5b611d10a17522752cc5dd05bb8de2edb11",
 "assets/sfx/ready.mp3": "8c63ef5d651b6da335719b559608656445c897e60d171f884ca0f9f97d48dcd0",
 "data/bot.txt": "0570e3166e4bf870297387d2cd491898bf8949e79fea636676733a96a9e2def0",
-"data/codes.db": "fae93572c41f9682c366acb2acc6e92b07dfc5f15401c5f528e5378bf1db1ffc",
-"data/revoked.txt": "1f6ca727ed22e6a0af7cd2178b1204899afdaea30a5ede220f4e25075eab3e01",
 "data/server.txt": "bb064dae9f8e0e721eea35a07cdd29b57bdc55e03b21bee1d41d93d15b37027f"
 }
 }

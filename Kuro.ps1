@@ -13,7 +13,7 @@ if ($Global:CCH_Debug) { $ErrorActionPreference = 'Continue' } else { $ErrorActi
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Off
 
-$Global:CCH_Version = '2.9.4'
+$Global:CCH_Version = '2.9.5'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -110,7 +110,7 @@ try {
     }
 } catch { }
 
-if (-not (Test-Path (Join-Path $Global:AppDir 'data\codes.db'))) {
+if (-not (Test-Path (Join-Path $Global:AppDir 'assets\Kuro.png'))) {
     Show-Fatal 'Extract the zip first' ("Kuro could not find its 'data' folder next to the app:`n" + $Global:AppDir + "`n`nRight-click the downloaded zip > Extract All..., open the extracted Kuro folder and run 'Launch Kuro.bat' from there.")
     exit
 }
@@ -1581,17 +1581,18 @@ function Get-ScanReport($s) {
 
 # ==================================================================================================
 #  PREMIUM LICENSING  (one-time codes)
-#  The app only ships SHA-256 hashes of the codes (data\codes.db), never the codes themselves.
-#  A redeemed code is locked to this PC (MachineGuid) and recorded so it cannot be redeemed again.
-#  Optional: set a license server URL in Settings to make every code single-use worldwide.
+#  Codes are checked by the Kuro server, which signs each licence with the Kuro licence key. This app
+#  ships only the matching PUBLIC key and verifies that signature - no code list and no secret of any
+#  kind travel with the app, so a licence file cannot be forged or hand-made. A redeemed code locks to
+#  this PC (MachineGuid); moving it to another PC goes through a Kuro account (up to 3 PCs).
 # ==================================================================================================
 
-$Global:LicPepper   = 'CCH:fc0ffc61977afccc4d42ac44daa6b0c1b75af1e021140ef8'
-$Global:IntegrityBaseline = 'cf46a63a0211d0600091c6e9949236fee443b5810698337e2b63360586d09c3d'
+$Global:IntegrityBaseline = '421654e6734e47bda4dd4b04af99605685b00f08e7bdad7976555c57b75bd82a'
 $Global:LicFile     = Join-Path $Global:DataDir 'license.dat'
 $Global:LicLedgerKey = 'HKLM:\SOFTWARE\Kuro\Redeemed'
-$Global:LicCodes    = New-Object 'System.Collections.Generic.HashSet[string]'
-$Global:LicRevoked  = New-Object 'System.Collections.Generic.HashSet[string]'
+# Public half of the Kuro licence-signing key. The private half lives only on the Kuro server, so only
+# the server can issue a licence this app will accept. There is no secret in this file to find or reuse.
+$Global:LicPubKeyXml = '<RSAKeyValue><Modulus>wPI8IR7NN+nLbo9sWlrNYUWnJRSAZMGyMf41Vau5zFMJ3oq118PkUVjiv7Odaity95xC2NK5dKQPnKglOjCVWUClUX9gA4fR/eVjTxN/ZamPPFjA/ZlNE8SoO8H6xnFOBcfirF9JPJDPwStMsl3ei7/xwehEOpdD03NdODUsAtbHRa/F7JE5uil89Lucj+XwmTJcMKQD8TXoH8NDo1PQYlqlv+LV8umUsso70l1B6qpYhCL7F3E4wD9Rys2Jp5oxv8FGjcxkAiJl3FiMF682lL1rw402skL6JtKp+rAx5LRGJUR4WbLjPkdwNFHp9rPUalEnIEM9KltYWsUvFNXJfQ==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 
 function Get-Sha256Hex([string]$Text) {
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -1599,14 +1600,16 @@ function Get-Sha256Hex([string]$Text) {
     return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
-function Get-HmacHex([string]$Text) {
-    $h = New-Object Security.Cryptography.HMACSHA256 (,[Text.Encoding]::UTF8.GetBytes($Global:LicPepper + '|license'))
-    try { $b = $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)) } finally { $h.Dispose() }
-    return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
-}
-
 function ConvertTo-NormalCode([string]$Code) { return (($Code.ToUpperInvariant()) -replace '[^A-Z0-9]', '') }
-function Get-CodeHash([string]$Code) { return (Get-Sha256Hex ($Global:LicPepper + (ConvertTo-NormalCode $Code))) }
+
+# Verify a server-signed licence grant. The signed text is exactly  hash|machine|expires  (expires 0 = lifetime).
+function Test-GrantSig($Hash, $Machine, $Expires, $Sig) {
+    if (-not $Sig -or -not $Hash) { return $false }
+    $canonical = '{0}|{1}|{2}' -f $Hash, $Machine, ([int64]$Expires)
+    $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider
+    try { $rsa.FromXmlString($Global:LicPubKeyXml); return $rsa.VerifyData([Text.Encoding]::UTF8.GetBytes($canonical), 'SHA256', [Convert]::FromBase64String($Sig)) }
+    catch { return $false } finally { $rsa.Dispose() }
+}
 
 function Test-ScriptIntegrity {
     # Verifies the app's own code has not been edited to force Premium. A compiled EXE embeds the
@@ -1632,15 +1635,41 @@ function Get-LicenseServer {
 }
 
 function Confirm-LicenseOnline {
-    # When a license server is configured, re-check with it on startup. Only drops Premium on a
-    # definite 'used elsewhere' or 'revoked' answer; a network failure leaves Premium untouched.
+    # Re-check with the server on startup. Also upgrades an older license.dat to a fresh server-signed
+    # one, so buyers from before this version keep Premium. Only drops Premium on a definite
+    # 'used elsewhere' / 'revoked' / 'expired' answer; a network problem leaves Premium untouched.
     $url = Get-LicenseServer
     if (-not $url) { return $true }
     $info = Get-LicenseInfo
     if (-not $info) { return $true }
-    $r = Invoke-OnlineRedeem ([string]$info.hash) ([string]$info.machine)
-    if (-not $r.Ok -and ($r.Reason -eq 'used' -or $r.Reason -eq 'invalid' -or $r.Reason -eq 'expired')) { return $false }
+    $r = Invoke-OnlineRedeem ([string]$info.hash) ([string]$info.machine) -ByHash
+    if (-not $r.Ok) {
+        if ($r.Reason -eq 'used' -or $r.Reason -eq 'invalid' -or $r.Reason -eq 'expired') { return $false }
+        return $true
+    }
+    $exp = [int64]0; if ($info.expires) { $exp = [int64]$info.expires }
+    if ($r.Sig -and (Test-GrantSig $info.hash $info.machine $exp $r.Sig) -and -not (Test-GrantSig $info.hash $info.machine $exp $info.sig)) {
+        Save-SignedLicense $info.hash $info.machine $exp $r.Days $r.Sig ([string]$info.activated) ([string]$info.code) | Out-Null
+    }
     return $true
+}
+
+function Repair-LicenseGrant {
+    # An older (pre-signing) license.dat, or one restored onto this PC, will not verify. If the Kuro
+    # server still recognises this licence for THIS machine, fetch a fresh signed grant and rewrite it.
+    # This never grants Premium by itself - the server must agree and the signature must check out.
+    if (-not (Get-LicenseServer)) { return $false }
+    $info = Get-LicenseInfo
+    if (-not $info -or -not $info.hash) { return $false }
+    $mid = Get-MachineId
+    if ([string]$info.machine -ne $mid) { return $false }
+    $r = Invoke-OnlineRedeem ([string]$info.hash) $mid -ByHash
+    if (-not $r.Ok -or -not $r.Sig) { return $false }
+    $exp = [int64]0
+    if ($info.expires) { $exp = [int64]$info.expires }
+    if ($r.Expires -gt 0) { $exp = [int64]$r.Expires }
+    if (-not (Test-GrantSig $info.hash $mid $exp $r.Sig)) { return $false }
+    return (Save-SignedLicense $info.hash $mid $exp $r.Days $r.Sig ([string]$info.activated) ([string]$info.code))
 }
 
 function Get-MachineId {
@@ -1656,12 +1685,6 @@ function Test-TimedCode([string]$Normal) { return ($Normal -match '^K([0-9]D|1M)
 
 function Get-KeyLengthText([int]$Days) {
     switch ($Days) { 1 { '1 day' } 3 { '3 day' } 7 { '1 week' } 30 { '1 month' } default { "$Days day" } }
-}
-
-function Get-LicenseSig($Hash, $Machine, $Activated, $Expires) {
-    # lifetime licences keep the original signature so every existing license.dat stays valid
-    if ([int64]$Expires -gt 0) { return (Get-HmacHex ("{0}|{1}|{2}|{3}" -f $Hash, $Machine, $Activated, [int64]$Expires)) }
-    return (Get-HmacHex ("{0}|{1}|{2}" -f $Hash, $Machine, $Activated))
 }
 
 function Get-LicenseExpiry {
@@ -1697,23 +1720,6 @@ function Format-TimeLeft([int64]$Ms) {
     return ('{0}m left' -f [math]::Max(1, [math]::Ceiling($ts.TotalMinutes)))
 }
 
-function Load-LicenseData {
-    $Global:LicCodes.Clear(); $Global:LicRevoked.Clear()
-    $db = Join-Path $Global:AppDir 'data\codes.db'
-    if (Test-Path $db) {
-        foreach ($l in [IO.File]::ReadAllLines($db)) { $x = $l.Trim(); if ($x.Length -eq 64) { [void]$Global:LicCodes.Add($x) } }
-    } else { Write-Log 'data\codes.db is missing - premium codes cannot be checked.' }
-    $rv = Join-Path $Global:AppDir 'data\revoked.txt'
-    if (Test-Path $rv) {
-        foreach ($l in [IO.File]::ReadAllLines($rv)) {
-            $x = $l.Trim()
-            if ($x -and -not $x.StartsWith('#')) {
-                if ($x.Length -eq 64 -and $x -match '^[0-9a-fA-F]+$') { [void]$Global:LicRevoked.Add($x.ToLower()) }
-                else { [void]$Global:LicRevoked.Add((Get-CodeHash $x)) }
-            }
-        }
-    }
-}
 
 function Test-CodeRedeemedHere([string]$Hash) {
     if ((Read-RegValue $Global:LicLedgerKey $Hash).Exists) { return $true }
@@ -1727,16 +1733,29 @@ function Add-CodeRedeemedHere([string]$Hash) {
     try { [IO.File]::AppendAllText((Join-Path $Global:DataDir 'redeemed.dat'), $Hash + "`r`n", $Global:Utf8NoBom) } catch { }
 }
 
+function Save-SignedLicense($Hash, $Machine, $Expires, $Days, $Sig, $Activated, $CodeMask) {
+    if (-not $Activated) { $Activated = Get-Date -Format 's' }
+    $lic = [ordered]@{
+        product   = $(if ([int64]$Expires -gt 0) { 'Kuro Premium (' + (Get-KeyLengthText $Days) + ' key)' } else { 'Kuro Premium' })
+        code      = $(if ($CodeMask) { $CodeMask } else { '(account)' })
+        hash      = $Hash
+        machine   = $Machine
+        activated = $Activated
+    }
+    if ([int64]$Expires -gt 0) { $lic.days = [int]$Days; $lic.expires = [string]([int64]$Expires) }
+    $lic.sig = $Sig
+    [IO.File]::WriteAllText($Global:LicFile, (ConvertTo-Json -InputObject $lic), $Global:Utf8NoBom)
+    return $true
+}
+
 function Test-License {
     if (-not (Test-Path $Global:LicFile)) { return $false }
     try {
         $l = [IO.File]::ReadAllText($Global:LicFile) | ConvertFrom-Json
         if ($l.machine -ne (Get-MachineId)) { return $false }
         $exp = [int64]0; if ($l.expires) { $exp = [int64]$l.expires }
-        # timed keys are made by the Discord bot, so they are checked by the server instead of data\codes.db
-        if ($exp -le 0 -and -not $Global:LicCodes.Contains([string]$l.hash)) { return $false }
-        if ($Global:LicRevoked.Contains([string]$l.hash)) { return $false }
-        if ((Get-LicenseSig $l.hash $l.machine $l.activated $exp) -ne $l.sig) { return $false }
+        # The server signed this grant; verify it with the built-in public key. No code list, no secret.
+        if (-not (Test-GrantSig $l.hash $l.machine $exp $l.sig)) { return $false }
         if ($exp -gt 0 -and ((Get-NowMs) -gt $exp -or -not (Test-ClockOk))) { return $false }
         return $true
     } catch { return $false }
@@ -1755,16 +1774,19 @@ function Get-LicenseInfo {
     try { return ([IO.File]::ReadAllText($Global:LicFile) | ConvertFrom-Json) } catch { return $null }
 }
 
-function Invoke-OnlineRedeem([string]$Hash, [string]$Machine) {
+function Invoke-OnlineRedeem($CodeOrHash, [string]$Machine, [switch]$ByHash) {
+    # Ask the Kuro server to redeem a code (ByHash: re-check a licence we already hold). The server
+    # validates, locks it to this PC and signs the result; we never compute or hold any code hash.
     $url = Get-LicenseServer
-    if (-not $url) { return @{ Ok = $true; Reason = 'offline' } }
+    if (-not $url) { return @{ Ok = $false; Reason = 'noserver' } }
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $body = ConvertTo-Json -InputObject @{ hash = $Hash; machine = $Machine } -Compress
+        $payload = if ($ByHash) { @{ hash = $CodeOrHash; machine = $Machine } } else { @{ code = $CodeOrHash; machine = $Machine } }
+        $body = ConvertTo-Json -InputObject $payload -Compress
         $r = Invoke-RestMethod -Uri ($url + '/redeem') -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15 -ErrorAction Stop
         $exp = [int64]0; $days = 0
         try { if ($r.expires) { $exp = [int64]$r.expires }; if ($r.days) { $days = [int]$r.days } } catch { }
-        return @{ Ok = [bool]$r.ok; Reason = [string]$r.reason; Expires = $exp; Days = $days }
+        return @{ Ok = [bool]$r.ok; Reason = [string]$r.reason; Expires = $exp; Days = $days; Hash = [string]$r.hash; Sig = [string]$r.sig }
     } catch {
         return @{ Ok = $false; Reason = 'network' }
     }
@@ -1775,51 +1797,38 @@ function Invoke-Redeem([string]$Code) {
     $n = ConvertTo-NormalCode $Code
     $timed = Test-TimedCode $n
     if ($n.Length -ne 15 -or -not ($n.StartsWith('CCH') -or $timed)) { return @{ Ok = $false; Msg = 'That does not look like a Kuro code. Format: CCH-XXXX-XXXX-XXXX (or K1D / K3D / K7D / K1M for timed keys)' } }
-    $h = Get-CodeHash $Code
-    if ($timed) {
-        if (-not (Get-LicenseServer)) { return @{ Ok = $false; Msg = 'Timed keys need the Kuro server. Update Kuro and try again.' } }
-    } elseif (-not $Global:LicCodes.Contains($h) -or $Global:LicRevoked.Contains($h)) {
-        Start-Sleep -Milliseconds 700   # slow down guessing
-        return @{ Ok = $false; Msg = 'Invalid code. Check for typos (codes never contain 0, O, 1 or I).' }
-    }
+    if (-not (Get-LicenseServer)) { return @{ Ok = $false; Msg = 'Kuro needs the internet to check this code. Connect and try again.' } }
+    # Don't spend a code if Premium is already active here.
     if (Test-License) {
-        $cur = Get-LicenseInfo
-        if ($cur -and $cur.hash -eq $h) { return @{ Ok = $true; Msg = 'This code is already active on this PC.' } }
-        # a timed key can be upgraded to lifetime straight away; lifetime never needs another code
         $curExp = Get-LicenseExpiry
         if ($curExp -le 0) { return @{ Ok = $false; Msg = 'Lifetime Premium is already active on this PC - keep this code for someone else.' } }
         if ($timed) { return @{ Ok = $false; Msg = ('Your current key still has ' + (Format-TimeLeft ($curExp - (Get-NowMs))) + '. Redeem this one after it ends so you do not lose any time (a lifetime code can be redeemed now).') } }
     }
-    if (Test-CodeRedeemedHere $h) { return @{ Ok = $false; Msg = 'This code has already been used and cannot be redeemed again.' } }
-
     $mid = Get-MachineId
-    $online = Invoke-OnlineRedeem $h $mid
+    $online = Invoke-OnlineRedeem $Code $mid
     if (-not $online.Ok) {
         switch ($online.Reason) {
-            'used'    { return @{ Ok = $false; Msg = 'This code has already been used on another PC.' } }
-            'invalid' { return @{ Ok = $false; Msg = 'This code is not valid on the license server.' } }
-            'expired' { return @{ Ok = $false; Msg = 'This key has run out. Get a new one in the Kuro Discord.' } }
+            'used'      { return @{ Ok = $false; Msg = 'This code has already been used on another PC.' } }
+            'invalid'   { return @{ Ok = $false; Msg = 'Invalid code. Check for typos (codes never contain 0, O, 1 or I).' } }
+            'expired'   { return @{ Ok = $false; Msg = 'This key has run out. Get a new one in the Kuro Discord.' } }
             'slow_down' { return @{ Ok = $false; Msg = 'Too many tries from this connection. Wait 10 minutes and try again.' } }
-            'network' { return @{ Ok = $false; Msg = 'Could not reach the license server. Check your internet connection and try again.' } }
-            default   { return @{ Ok = $false; Msg = 'The license server rejected this code.' } }
+            'noserver'  { return @{ Ok = $false; Msg = 'Kuro needs the internet to check this code. Connect and try again.' } }
+            'network'   { return @{ Ok = $false; Msg = 'Could not reach the license server. Check your internet connection and try again.' } }
+            default     { return @{ Ok = $false; Msg = 'The license server rejected this code.' } }
         }
     }
-
+    $h = [string]$online.Hash
     $exp = [int64]$online.Expires
-    if ($timed -and $exp -le 0) { return @{ Ok = $false; Msg = 'The license server did not return an end time for this key. Try again in a minute.' } }
-    $act = Get-Date -Format 's'
-    $lic = [ordered]@{
-        product   = $(if ($exp -gt 0) { 'Kuro Premium (' + (Get-KeyLengthText $online.Days) + ' key)' } else { 'Kuro Premium' })
-        code      = ($n.Substring(0, 3) + '-' + $n.Substring(3, 4) + '-****-' + $n.Substring(11, 4))
-        hash      = $h
-        machine   = $mid
-        activated = $act
+    if (-not $h -or -not $online.Sig -or -not (Test-GrantSig $h $mid $exp $online.Sig)) {
+        return @{ Ok = $false; Msg = 'The license server sent a reply Kuro could not verify. Update Kuro and try again.' }
     }
-    if ($exp -gt 0) { $lic.days = [int]$online.Days; $lic.expires = [string]$exp }
-    $lic.sig = Get-LicenseSig $h $mid $act $exp
-    [IO.File]::WriteAllText($Global:LicFile, (ConvertTo-Json -InputObject $lic), $Global:Utf8NoBom)
+    $cur = Get-LicenseInfo
+    if ($cur -and $cur.hash -eq $h -and (Test-License)) { return @{ Ok = $true; Msg = 'This code is already active on this PC.' } }
+    if ($timed -and $exp -le 0) { return @{ Ok = $false; Msg = 'The license server did not return an end time for this key. Try again in a minute.' } }
+    $mask = ($n.Substring(0, 3) + '-' + $n.Substring(3, 4) + '-****-' + $n.Substring(11, 4))
+    Save-SignedLicense $h $mid $exp $online.Days $online.Sig (Get-Date -Format 's') $mask | Out-Null
     Add-CodeRedeemedHere $h
-    Write-Log "Premium activated with code $($lic.code)"
+    Write-Log "Premium activated with code $mask"
     if ($exp -gt 0) {
         $end = [DateTimeOffset]::FromUnixTimeMilliseconds($exp).LocalDateTime
         return @{ Ok = $true; Msg = ('Premium unlocked until {0:ddd d MMM, HH:mm} ({1}). When it ends, Kuro puts every Premium change back by itself.' -f $end, (Format-TimeLeft ($exp - (Get-NowMs)))) }
@@ -1833,16 +1842,12 @@ function Invoke-Redeem([string]$Code) {
 #  stored only as a salted PBKDF2 hash on the server; this app never stores the password.
 # ==================================================================================================
 
-function Write-LocalLicense([string]$Hash, [int64]$Expires = 0, [int]$Days = 0) {
-    if (-not $Hash -or $Global:LicRevoked.Contains($Hash)) { return $false }
-    if ($Expires -gt 0) { if ((Get-NowMs) -gt $Expires) { return $false } }   # timed key on the account has run out
-    elseif (-not $Global:LicCodes.Contains($Hash)) { return $false }
-    $mid = Get-MachineId
-    $act = Get-Date -Format 's'
-    $lic = [ordered]@{ product = 'Kuro Premium'; code = '(account)'; hash = $Hash; machine = $mid; activated = $act }
-    if ($Expires -gt 0) { $lic.product = 'Kuro Premium (' + (Get-KeyLengthText $Days) + ' key)'; $lic.days = $Days; $lic.expires = [string]$Expires }
-    $lic.sig = Get-LicenseSig $Hash $mid $act $Expires
-    [IO.File]::WriteAllText($Global:LicFile, (ConvertTo-Json -InputObject $lic), $Global:Utf8NoBom)
+function Write-LocalLicense([string]$Hash, [string]$Machine, [int64]$Expires, [int]$Days, [string]$Sig) {
+    # Writes a licence file the app will trust ONLY if the server actually signed this grant.
+    if (-not $Hash -or -not $Sig) { return $false }
+    if ($Expires -gt 0 -and (Get-NowMs) -gt $Expires) { return $false }   # timed key on the account has run out
+    if (-not (Test-GrantSig $Hash $Machine $Expires $Sig)) { return $false }
+    Save-SignedLicense $Hash $Machine $Expires $Days $Sig (Get-Date -Format 's') '(account)' | Out-Null
     Write-Log 'Premium restored from account on this PC.'
     return $true
 }
@@ -1887,7 +1892,7 @@ function Login-Account([string]$User, [string]$Pass) {
     $msg = 'Logged in. No Premium is linked to this account yet.'
     if ($lic) {
         if (Test-License) { $msg = 'Logged in. Premium is active.' }
-        elseif (Write-LocalLicense $lic ([int64]$(if ($r.expires) { $r.expires } else { 0 })) ([int]$(if ($r.days) { $r.days } else { 0 }))) { $msg = 'Logged in. Premium restored on this PC!' }
+        elseif (Write-LocalLicense $lic (Get-MachineId) ([int64]$(if ($r.expires) { $r.expires } else { 0 })) ([int]$(if ($r.days) { $r.days } else { 0 })) ([string]$r.sig)) { $msg = 'Logged in. Premium restored on this PC!' }
         elseif ($r.expires -and [int64]$r.expires -lt (Get-NowMs)) { $msg = 'Logged in, but the timed key on this account has run out.' }
         else { $msg = 'Logged in, but the linked Premium code is not valid in this version.' }
     } elseif (Test-License) {
@@ -2855,6 +2860,9 @@ function Invoke-Tool([string]$Id) {
 # ------------------------------------------------------------------ premium UI
 function Update-PremiumUI {
     $Global:CCH.Tampered = -not (Test-ScriptIntegrity)
+    # A licence from before signed grants (or one just restored) won't verify yet: ask the server to
+    # re-sign it for this PC so existing buyers keep Premium without doing anything.
+    if (-not $Global:CCH.Tampered -and (Test-Path $Global:LicFile) -and -not (Test-License)) { Repair-LicenseGrant | Out-Null }
     $Global:CCH.Premium = (Test-License) -and (-not $Global:CCH.Tampered)
     if ($Global:CCH.Premium -and -not (Confirm-LicenseOnline)) {
         $Global:CCH.Premium = $false
@@ -10330,7 +10338,6 @@ $Global:MainXaml = @'
 function Start-Kuro {
     Load-Settings
     Load-Backup
-    Load-LicenseData
 
     $win = [Windows.Markup.XamlReader]::Parse($Global:MainXaml)
     $win.Dispatcher.Add_UnhandledException({
