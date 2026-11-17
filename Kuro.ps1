@@ -13,7 +13,7 @@ if ($Global:CCH_Debug) { $ErrorActionPreference = 'Continue' } else { $ErrorActi
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Off
 
-$Global:CCH_Version = '2.9.2'
+$Global:CCH_Version = '2.9.3'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -1587,7 +1587,7 @@ function Get-ScanReport($s) {
 # ==================================================================================================
 
 $Global:LicPepper   = 'CCH:fc0ffc61977afccc4d42ac44daa6b0c1b75af1e021140ef8'
-$Global:IntegrityBaseline = 'a214a27ecdab46cdef1fead0ac4a681bc7b382901386888a750771d514f3229e'
+$Global:IntegrityBaseline = '034e3faa31097c38d4ef917c9db7054aad6856a64462f18a4a77a9662bb5807b'
 $Global:LicFile     = Join-Path $Global:DataDir 'license.dat'
 $Global:LicLedgerKey = 'HKLM:\SOFTWARE\Kuro\Redeemed'
 $Global:LicCodes    = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -1652,7 +1652,11 @@ function Get-MachineId {
 # ------------------------------------------------------------------ timed keys (1 day / 3 days / 1 week)
 function Get-NowMs { return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 
-function Test-TimedCode([string]$Normal) { return ($Normal -match '^K[0-9]D[A-Z0-9]{12}$') }
+function Test-TimedCode([string]$Normal) { return ($Normal -match '^K([0-9]D|1M)[A-Z0-9]{12}$') }
+
+function Get-KeyLengthText([int]$Days) {
+    switch ($Days) { 1 { '1 day' } 3 { '3 day' } 7 { '1 week' } 30 { '1 month' } default { "$Days day" } }
+}
 
 function Get-LicenseSig($Hash, $Machine, $Activated, $Expires) {
     # lifetime licences keep the original signature so every existing license.dat stays valid
@@ -1770,7 +1774,7 @@ function Invoke-Redeem([string]$Code) {
     if (-not (Test-ScriptIntegrity)) { return @{ Ok = $false; Msg = 'This copy of Kuro has been modified, so Premium is disabled. Please download a fresh copy from the official Discord.' } }
     $n = ConvertTo-NormalCode $Code
     $timed = Test-TimedCode $n
-    if ($n.Length -ne 15 -or -not ($n.StartsWith('CCH') -or $timed)) { return @{ Ok = $false; Msg = 'That does not look like a Kuro code. Format: CCH-XXXX-XXXX-XXXX (or K1D / K3D / K7D for timed keys)' } }
+    if ($n.Length -ne 15 -or -not ($n.StartsWith('CCH') -or $timed)) { return @{ Ok = $false; Msg = 'That does not look like a Kuro code. Format: CCH-XXXX-XXXX-XXXX (or K1D / K3D / K7D / K1M for timed keys)' } }
     $h = Get-CodeHash $Code
     if ($timed) {
         if (-not (Get-LicenseServer)) { return @{ Ok = $false; Msg = 'Timed keys need the Kuro server. Update Kuro and try again.' } }
@@ -1804,7 +1808,7 @@ function Invoke-Redeem([string]$Code) {
     if ($timed -and $exp -le 0) { return @{ Ok = $false; Msg = 'The license server did not return an end time for this key. Try again in a minute.' } }
     $act = Get-Date -Format 's'
     $lic = [ordered]@{
-        product   = $(if ($exp -gt 0) { 'Kuro Premium (' + $online.Days + ' day key)' } else { 'Kuro Premium' })
+        product   = $(if ($exp -gt 0) { 'Kuro Premium (' + (Get-KeyLengthText $online.Days) + ' key)' } else { 'Kuro Premium' })
         code      = ($n.Substring(0, 3) + '-' + $n.Substring(3, 4) + '-****-' + $n.Substring(11, 4))
         hash      = $h
         machine   = $mid
@@ -1835,7 +1839,7 @@ function Write-LocalLicense([string]$Hash, [int64]$Expires = 0, [int]$Days = 0) 
     $mid = Get-MachineId
     $act = Get-Date -Format 's'
     $lic = [ordered]@{ product = 'Kuro Premium'; code = '(account)'; hash = $Hash; machine = $mid; activated = $act }
-    if ($Expires -gt 0) { $lic.product = "Kuro Premium ($Days day key)"; $lic.days = $Days; $lic.expires = [string]$Expires }
+    if ($Expires -gt 0) { $lic.product = 'Kuro Premium (' + (Get-KeyLengthText $Days) + ' key)'; $lic.days = $Days; $lic.expires = [string]$Expires }
     $lic.sig = Get-LicenseSig $Hash $mid $act $Expires
     [IO.File]::WriteAllText($Global:LicFile, (ConvertTo-Json -InputObject $lic), $Global:Utf8NoBom)
     Write-Log 'Premium restored from account on this PC.'
@@ -2873,7 +2877,7 @@ function Update-PremiumUI {
             $end = [DateTimeOffset]::FromUnixTimeMilliseconds($exp).LocalDateTime
             $ui.StatPremiumSub.Text = 'Timed key: ' + $left
             $ui.PremStatus.Text = 'Premium is active on this PC  -  ' + $left
-            $ui.PremSub.Text = ('{0}-day key {1}  -  ends {2:ddd d MMM, HH:mm}. When it ends Kuro puts every Premium change back by itself. A lifetime code can be redeemed any time to upgrade.' -f $info.days, $info.code, $end)
+            $ui.PremSub.Text = ('{0} key {1}  -  ends {2:ddd d MMM, HH:mm}. When it ends Kuro puts every Premium change back by itself. A lifetime code can be redeemed any time to upgrade.' -f (Get-KeyLengthText ([int]$info.days)), $info.code, $end)
         }
         # a timed key can be upgraded to lifetime, so keep the code box open for it
         $ui.BtnRedeem.IsEnabled = ($exp -gt 0)
@@ -8151,7 +8155,7 @@ function Invoke-PremiumExpiry {
     $info = Get-LicenseInfo
     if (-not $info -or -not $info.expires) { return }
     $days = [int]$info.days
-    $what = $(if ($days -eq 1) { '1 day' } elseif ($days -eq 7) { '1 week' } elseif ($days -gt 0) { "$days day" } else { 'timed' })
+    $what = $(if ($days -gt 0) { Get-KeyLengthText $days } else { 'timed' })
     # keep a record, then remove the licence so nothing treats this PC as Premium any more
     try { Move-Item -LiteralPath $Global:LicFile -Destination (Join-Path $Global:DataDir 'license.expired.dat') -Force -ErrorAction Stop }
     catch { try { Remove-Item -LiteralPath $Global:LicFile -Force -ErrorAction SilentlyContinue } catch { } }
