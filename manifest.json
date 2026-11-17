@@ -31,6 +31,7 @@
 "assets/sfx/engine.mp3": "07548389d5cd6cb096826406f68cc5b611d10a17522752cc5dd05bb8de2edb11",
 "assets/sfx/ready.mp3": "8c63ef5d651b6da335719b559608656445c897e60d171f884ca0f9f97d48dcd0",
 "data/codes.db": "fae93572c41f9682c366acb2acc6e92b07dfc5f15401c5f528e5378bf1db1ffc",
-"data/revoked.txt": "1f6ca727ed22e6a0af7cd2178b1204899afdaea30a5ede220f4e25075eab3e01"
+"data/revoked.txt": "1f6ca727ed22e6a0af7cd2178b1204899afdaea30a5ede220f4e25075eab3e01",
+"data/server.txt": "bb064dae9f8e0e721eea35a07cdd29b57bdc55e03b21bee1d41d93d15b37027f"
 }
 }
