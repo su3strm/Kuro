@@ -3,7 +3,7 @@ title Kuro
 rem Starts Kuro. Windows will ask for administrator permission (needed for registry, services and power tweaks).
 rem The first time it runs from a downloaded folder it installs Kuro (Desktop + Start menu shortcuts) and starts it.
 cd /d "%~dp0"
-if not exist "%~dp0data\codes.db" (
+if not exist "%~dp0Kuro.ps1" (
     echo.
     echo  Kuro can't find its files.
     echo  Right-click the downloaded zip, choose "Extract All...", then run
