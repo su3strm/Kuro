@@ -13,7 +13,7 @@ if ($Global:CCH_Debug) { $ErrorActionPreference = 'Continue' } else { $ErrorActi
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Off
 
-$Global:CCH_Version = '2.9.5'
+$Global:CCH_Version = '2.9.6'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
 
@@ -1587,7 +1587,7 @@ function Get-ScanReport($s) {
 #  this PC (MachineGuid); moving it to another PC goes through a Kuro account (up to 3 PCs).
 # ==================================================================================================
 
-$Global:IntegrityBaseline = '421654e6734e47bda4dd4b04af99605685b00f08e7bdad7976555c57b75bd82a'
+$Global:IntegrityBaseline = 'f86d3de9a1928304a37c9fd8b286bba71882d772861c37eb70181b425e10f50f'
 $Global:LicFile     = Join-Path $Global:DataDir 'license.dat'
 $Global:LicLedgerKey = 'HKLM:\SOFTWARE\Kuro\Redeemed'
 # Public half of the Kuro licence-signing key. The private half lives only on the Kuro server, so only
@@ -1898,8 +1898,9 @@ function Login-Account([string]$User, [string]$Pass) {
     } elseif (Test-License) {
         $info = Get-LicenseInfo
         if ($info) {
-            $lr = Invoke-AccountApi '/link' @{ username = $User; password = $Pass; license = [string]$info.hash }
+            $lr = Invoke-AccountApi '/link' @{ username = $User; password = $Pass; license = [string]$info.hash; machine = (Get-MachineId) }
             if ($lr.ok) { $msg = 'Logged in. Your Premium is now linked to this account.' }
+            elseif ([string]$lr.reason -eq 'not_owner') { $msg = 'Logged in. Premium can only be linked from the PC the code was redeemed on.' }
         }
     }
     return @{ Ok = $true; Msg = $msg }
