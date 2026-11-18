@@ -1,8 +1,8 @@
 {
-"version": "2.9.8",
+"version": "2.9.9",
 "files": {
 "Launch Kuro.bat": "385b38d771da11daa8e65525115fee90cfe31b2029b295600c0ffe17173fe553",
-"Kuro.ps1": "bc229ecf71f740325a5f63711ef09a94ab5fa59b03413194c3688a2e124fe128",
+"Kuro.ps1": "e4351922fbda03f70d46c00aed2ef37dffb08bbba1de4d00dcc934f070f359c4",
 "README.md": "ece1dea982d84a7aefa6af7248f8f90fcd1fa622902823ad1ed787c35e358aba",
 "Install-Kuro.ps1": "89a71b6ad2bc11e10bbdc575d3f2399802b9b05346e958c51e63c2622161a814",
 "Launch Kuro (debug).bat": "860a3caac0d61862bb85145a00318742015e593b17507d1a9bafbd91870d340c",
